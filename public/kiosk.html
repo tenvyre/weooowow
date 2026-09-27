@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Smart Pump Kiosk</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { background: #020617; color: #f8fafc; display: flex; flex-direction: column; min-height: 100vh; padding: 20px; }
+    header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #1e293b; padding-bottom: 15px; margin-bottom: 20px; }
+    .badge { background: #0369a1; color: #e0f2fe; padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: bold; }
+    .container { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; max-width: 1000px; margin: 0 auto; width: 100%; flex: 1; }
+    .card { background: #0f172a; border: 1px solid #1e293b; border-radius: 16px; padding: 24px; display: flex; flex-direction: column; justify-content: space-between; }
+    .presets { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin-top: 15px; }
+    .preset-btn { background: #1e293b; border: 1px solid #334155; color: white; padding: 16px; border-radius: 12px; font-size: 16px; font-weight: bold; cursor: pointer; transition: all 0.2s; }
+    .preset-btn:hover, .preset-btn.active { background: #0284c7; border-color: #38bdf8; }
+    .vessel { width: 180px; height: 260px; border: 4px solid #475569; border-radius: 0 0 24px 24px; margin: 20px auto; position: relative; background: #020617; overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end; }
+    .fluid { background: #0284c7; width: 100%; height: 0%; transition: height 0.2s ease; position: relative; }
+    .vessel-label { position: absolute; inset: 0; display: flex; flex-direction: column; justify-content: center; align-items: center; font-size: 24px; font-weight: bold; text-shadow: 0 2px 4px rgba(0,0,0,0.8); }
+    .btn-dispense { background: #16a34a; border: none; color: white; padding: 18px; border-radius: 14px; font-size: 18px; font-weight: bold; cursor: pointer; width: 100%; margin-top: 15px; transition: background 0.2s; }
+    .btn-dispense:hover { background: #15803d; }
+    .btn-stop { background: #dc2626; border: none; color: white; padding: 14px; border-radius: 12px; font-size: 14px; font-weight: bold; cursor: pointer; width: 100%; margin-top: 10px; }
+    .btn-stop:hover { background: #b91c1c; }
+    .stats { display: flex; justify-content: space-around; background: #020617; padding: 12px; border-radius: 10px; border: 1px solid #1e293b; font-family: monospace; font-size: 13px; margin-top: 15px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h2>Smart Dispense Kiosk</h2>
+      <span style="font-size: 12px; color: #94a3b8;">Automated Liquid Dispensing System</span>
+    </div>
+    <span id="connStatus" class="badge">Checking Server...</span>
+  </header>
+
+  <div class="container">
+    <div class="card">
+      <div>
+        <h3>1. Select Volume</h3>
+        <p style="font-size: 12px; color: #94a3b8; margin-top: 4px;">Choose the target liquid volume to dispense</p>
+        <div class="presets">
+          <button class="preset-btn" onclick="selectVolume(250)">250 mL</button>
+          <button class="preset-btn active" onclick="selectVolume(500)">500 mL</button>
+          <button class="preset-btn" onclick="selectVolume(750)">750 mL</button>
+          <button class="preset-btn" onclick="selectVolume(1000)">1,000 mL</button>
+        </div>
+      </div>
+      <div>
+        <button id="dispenseBtn" class="btn-dispense" onclick="toggleDispense()">START DISPENSE</button>
+        <button class="btn-stop" onclick="emergencyStop()">EMERGENCY STOP</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>2. Chamber Monitor</h3>
+      <div class="vessel">
+        <div id="fluidLevel" class="fluid"></div>
+        <div class="vessel-label">
+          <span id="dispensedText">0</span>
+          <span style="font-size: 12px; font-weight: normal; color: #cbd5e1;">/ <span id="targetText">500</span> mL</span>
+        </div>
+      </div>
+      <div class="stats">
+        <div>Flow: <span id="flowRate" style="color: #38bdf8;">0.00</span> L/min</div>
+        <div>Pulses: <span id="pulseCount" style="color: #34d399;">0</span></div>
+        <div>Pump: <span id="pumpStatus" style="color: #94a3b8;">IDLE</span></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let targetMl = 500;
+    let isDispensing = false;
+    let dispensedMl = 0;
+    let pulses = 0;
+    let kFactor = 4.5; // pulses per mL
+    let timer = null;
+
+    function selectVolume(ml) {
+      if (isDispensing) return;
+      targetMl = ml;
+      document.getElementById('targetText').innerText = ml;
+      document.querySelectorAll('.preset-btn').forEach(b => {
+        b.classList.toggle('active', b.innerText.includes(ml));
+      });
+      updateVessel();
+    }
+
+    function updateVessel() {
+      const pct = Math.min(100, Math.round((dispensedMl / targetMl) * 100));
+      document.getElementById('fluidLevel').style.height = pct + '%';
+      document.getElementById('dispensedText').innerText = Math.round(dispensedMl);
+    }
+
+    function toggleDispense() {
+      if (!isDispensing) {
+        startDispense();
+      } else {
+        stopDispense();
+      }
+    }
+
+    function startDispense() {
+      isDispensing = true;
+      dispensedMl = 0;
+      pulses = 0;
+      document.getElementById('dispenseBtn').innerText = 'PAUSE DISPENSE';
+      document.getElementById('dispenseBtn').style.background = '#d97706';
+      document.getElementById('pumpStatus').innerText = 'RUNNING';
+      document.getElementById('pumpStatus').style.color = '#34d399';
+      document.getElementById('flowRate').innerText = '2.80';
+
+      // Send to backend REST if available
+      fetch('/api/dispense/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ml: targetMl })
+      }).catch(() => {});
+
+      // Simulator fallback
+      timer = setInterval(() => {
+        dispensedMl += 5; // 50 mL/sec = 3 L/min
+        pulses += Math.round(5 * kFactor);
+        document.getElementById('pulseCount').innerText = pulses;
+        updateVessel();
+
+        if (dispensedMl >= targetMl) {
+          dispensedMl = targetMl;
+          updateVessel();
+          stopDispense(true);
+        }
+      }, 100);
+    }
+
+    function stopDispense(completed = false) {
+      isDispensing = false;
+      clearInterval(timer);
+      document.getElementById('dispenseBtn').innerText = completed ? 'DISPENSED - START AGAIN' : 'START DISPENSE';
+      document.getElementById('dispenseBtn').style.background = '#16a34a';
+      document.getElementById('pumpStatus').innerText = completed ? 'COMPLETE' : 'IDLE';
+      document.getElementById('pumpStatus').style.color = completed ? '#38bdf8' : '#94a3b8';
+      document.getElementById('flowRate').innerText = '0.00';
+
+      fetch('/api/dispense/stop', { method: 'POST' }).catch(() => {});
+    }
+
+    function emergencyStop() {
+      stopDispense();
+      alert('Emergency stop activated! Pump halted.');
+    }
+
+    // Check backend connection
+    fetch('/api/status')
+      .then(res => res.json())
+      .then(data => {
+        document.getElementById('connStatus').innerText = data.connected ? 'Hardware Connected' : 'Python Server (Ready)';
+        document.getElementById('connStatus').style.background = '#059669';
+      })
+      .catch(() => {
+        document.getElementById('connStatus').innerText = 'Simulator Active';
+      });
+  </script>
+</body>
+</html>

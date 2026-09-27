@@ -1,0 +1,6 @@
+{
+  "name": "Smart Pump Controller & Dispensing Kiosk",
+  "description": "Industrial liquid dispensing kiosk and hardware diagnostics test console with Web Serial Arduino integration and live simulation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
