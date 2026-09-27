@@ -10,51 +10,85 @@
     header { border-bottom: 1px solid #1e293b; padding-bottom: 15px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; }
     .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; max-width: 1100px; margin: 0 auto; }
     .box { background: #0f172a; border: 1px solid #1e293b; border-radius: 12px; padding: 20px; }
-    .btn { background: #0284c7; color: white; border: none; padding: 10px 16px; border-radius: 8px; font-weight: bold; cursor: pointer; margin-right: 8px; margin-bottom: 8px; }
+    .btn { background: #0284c7; color: white; border: none; padding: 10px 16px; border-radius: 8px; font-weight: bold; cursor: pointer; margin-right: 8px; margin-bottom: 8px; transition: opacity 0.2s; }
+    .btn:hover { opacity: 0.9; }
     .btn-green { background: #16a34a; }
     .btn-red { background: #dc2626; }
+    .btn-amber { background: #d97706; }
     .terminal { background: #000; color: #4ade80; font-family: monospace; font-size: 13px; height: 260px; overflow-y: auto; padding: 12px; border-radius: 8px; border: 1px solid #1e293b; margin-top: 10px; }
     .input-row { display: flex; gap: 10px; margin-top: 10px; }
     input { background: #020617; border: 1px solid #334155; color: white; padding: 10px; border-radius: 8px; flex: 1; font-family: monospace; }
+    .status-bar { display: flex; gap: 15px; background: #020617; padding: 10px 15px; border-radius: 8px; border: 1px solid #1e293b; margin-bottom: 15px; font-size: 13px; font-family: monospace; }
+    .status-item { display: flex; align-items: center; gap: 6px; }
+    .indicator { width: 8px; height: 8px; border-radius: 50%; background: #64748b; }
+    .indicator.active { background: #34d399; box-shadow: 0 0 8px #34d399; }
   </style>
 </head>
 <body>
   <header>
     <div>
       <h2>Hardware Diagnostic &amp; Calibration Console</h2>
-      <span style="font-size: 12px; color: #94a3b8;">Arduino Relay &amp; Flow Sensor Control</span>
+      <span style="font-size: 12px; color: #94a3b8;">Virtual Pumper Test Suite &amp; Main UI Bridge</span>
     </div>
-    <a href="/kiosk.html" style="color: #38bdf8; font-size: 13px; text-decoration: none;">&larr; Back to Kiosk</a>
+    <div style="display: flex; gap: 15px; align-items: center;">
+      <span id="syncBadge" style="font-size: 12px; color: #34d399; background: #064e3b; padding: 4px 10px; border-radius: 999px;">
+        Synced with Main UI
+      </span>
+      <a href="/kiosk.html" style="color: #38bdf8; font-size: 13px; text-decoration: none;">&larr; Open Kiosk View</a>
+    </div>
   </header>
+
+  <div class="status-bar">
+    <div class="status-item">
+      <span id="pumpLed" class="indicator"></span>
+      <span>Pump Relay: <strong id="pumpTxt" style="color: #94a3b8;">OFF</strong></span>
+    </div>
+    <div class="status-item">
+      <span id="valveLed" class="indicator"></span>
+      <span>Valve: <strong id="valveTxt" style="color: #94a3b8;">CLOSED</strong></span>
+    </div>
+    <div class="status-item">
+      <span>Flow: <strong id="flowTxt" style="color: #38bdf8;">0.00</strong> L/min</span>
+    </div>
+    <div class="status-item">
+      <span>Dispensed: <strong id="mlTxt" style="color: #34d399;">0</strong> mL</span>
+    </div>
+    <div class="status-item">
+      <span>Pulses: <strong id="pulseTxt" style="color: #f59e0b;">0</strong></span>
+    </div>
+  </div>
 
   <div class="grid">
     <div class="box">
-      <h3 style="margin-bottom: 15px;">Manual Actuation</h3>
+      <h3 style="margin-bottom: 15px;">Manual Actuation &amp; Virtual Pumper Tests</h3>
+      
       <div style="margin-bottom: 20px;">
-        <p style="font-size: 13px; color: #cbd5e1; margin-bottom: 8px;">Relay 1: Main Dispense Pump</p>
+        <p style="font-size: 13px; color: #cbd5e1; margin-bottom: 8px;">Relay 1: Main Dispense Pump (Updates Main UI Live)</p>
         <button class="btn btn-green" onclick="relay(1, 'on')">Turn Pump ON</button>
         <button class="btn btn-red" onclick="relay(1, 'off')">Turn Pump OFF</button>
+        <button class="btn btn-amber" onclick="pulsePump(1000)">1-Sec Test Pulse</button>
       </div>
 
       <div style="margin-bottom: 20px;">
-        <p style="font-size: 13px; color: #cbd5e1; margin-bottom: 8px;">Relay 2: Solenoid Valve</p>
+        <p style="font-size: 13px; color: #cbd5e1; margin-bottom: 8px;">Relay 2: Solenoid Anti-Drip Valve</p>
         <button class="btn btn-green" onclick="relay(2, 'on')">Open Valve</button>
         <button class="btn btn-red" onclick="relay(2, 'off')">Close Valve</button>
       </div>
 
       <div>
-        <p style="font-size: 13px; color: #cbd5e1; margin-bottom: 8px;">Quick Test Sequences</p>
+        <p style="font-size: 13px; color: #cbd5e1; margin-bottom: 8px;">Automated Dispense Tests (Watch Main Kiosk React)</p>
         <button class="btn" onclick="sendCmd('START:250')">Dispense 250mL</button>
         <button class="btn" onclick="sendCmd('START:500')">Dispense 500mL</button>
+        <button class="btn" onclick="sendCmd('START:1000')">Dispense 1,000mL</button>
         <button class="btn btn-red" onclick="sendCmd('STOP')">Emergency Stop</button>
       </div>
     </div>
 
     <div class="box">
-      <h3>Live Serial Terminal</h3>
-      <div id="term" class="terminal">[SYSTEM] Diagnostic console ready.</div>
+      <h3>Live Serial &amp; Hardware Event Log</h3>
+      <div id="term" class="terminal">[SYSTEM] Virtual pumper test bridge initialized.</div>
       <div class="input-row">
-        <input id="cmdInput" type="text" placeholder="Command (e.g. STATUS, START:500, PING)..." onkeydown="if(event.key==='Enter') sendCustom()">
+        <input id="cmdInput" type="text" placeholder="Command (e.g. STATUS, START:500, RELAY:1:ON, PING)..." onkeydown="if(event.key==='Enter') sendCustom()">
         <button class="btn" onclick="sendCustom()">Send</button>
       </div>
     </div>
@@ -62,6 +96,14 @@
 
   <script>
     const term = document.getElementById('term');
+    let syncChannel = null;
+
+    try {
+      syncChannel = new BroadcastChannel('pump_virtual_channel');
+      syncChannel.onmessage = (e) => {
+        handleIncomingSync(e.data);
+      };
+    } catch (err) {}
 
     function log(msg, color = '#4ade80') {
       const line = document.createElement('div');
@@ -75,8 +117,24 @@
       log(`[TX] RELAY:${id}:${state.toUpperCase()}`, '#fbbf24');
       fetch(`/api/relay/${id}/${state}`, { method: 'POST' })
         .then(r => r.json())
-        .then(d => log(`[RX] Relay ${id} set to ${state}`, '#38bdf8'))
-        .catch(() => log(`[MOCK] Relay ${id} -> ${state.toUpperCase()}`));
+        .then(() => log(`[RX] OK:RELAY${id}=${state.toUpperCase()}`, '#38bdf8'))
+        .catch(() => log(`[VIRTUAL] Relay ${id} set to ${state.toUpperCase()}`));
+
+      if (syncChannel) {
+        syncChannel.postMessage({
+          type: 'RELAY',
+          relay: id,
+          state: state === 'on',
+          pump: id === 1 ? state === 'on' : undefined,
+          flow_rate: id === 1 && state === 'on' ? 2.85 : 0.0
+        });
+      }
+    }
+
+    function pulsePump(durationMs) {
+      log(`[VIRTUAL] Pulsing Relay 1 for ${durationMs}ms`, '#f59e0b');
+      relay(1, 'on');
+      setTimeout(() => relay(1, 'off'), durationMs);
     }
 
     function sendCmd(cmd) {
@@ -88,8 +146,21 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ ml })
         }).catch(() => {});
-      } else if (cmd === 'STOP') {
+
+        if (syncChannel) {
+          syncChannel.postMessage({
+            type: 'START_DISPENSE',
+            target_ml: ml,
+            status: 'dispensing',
+            pump: true,
+            flow_rate: 2.85
+          });
+        }
+      } else if (cmd === 'STOP' || cmd === 'CANCEL') {
         fetch('/api/dispense/stop', { method: 'POST' }).catch(() => {});
+        if (syncChannel) {
+          syncChannel.postMessage({ type: 'STOP_DISPENSE', status: 'idle', pump: false, flow_rate: 0 });
+        }
       }
     }
 
@@ -100,6 +171,39 @@
       sendCmd(val);
       inp.value = '';
     }
+
+    function handleIncomingSync(data) {
+      if (!data) return;
+      if (data.pump !== undefined) {
+        document.getElementById('pumpLed').className = data.pump ? 'indicator active' : 'indicator';
+        document.getElementById('pumpTxt').innerText = data.pump ? 'ENERGIZED' : 'OFF';
+        document.getElementById('pumpTxt').style.color = data.pump ? '#34d399' : '#94a3b8';
+      }
+      if (data.valve !== undefined) {
+        document.getElementById('valveLed').className = data.valve ? 'indicator active' : 'indicator';
+        document.getElementById('valveTxt').innerText = data.valve ? 'OPEN' : 'CLOSED';
+        document.getElementById('valveTxt').style.color = data.valve ? '#34d399' : '#94a3b8';
+      }
+      if (typeof data.flow_rate === 'number') {
+        document.getElementById('flowTxt').innerText = data.flow_rate.toFixed(2);
+      }
+      if (typeof data.dispensed_ml === 'number') {
+        document.getElementById('mlTxt').innerText = Math.round(data.dispensed_ml);
+      }
+      if (typeof data.total_pulses === 'number') {
+        document.getElementById('pulseTxt').innerText = data.total_pulses;
+      }
+    }
+
+    // High frequency backend polling for virtual pumper synchronization
+    setInterval(() => {
+      fetch('/api/status')
+        .then(res => res.json())
+        .then(data => {
+          handleIncomingSync(data);
+        })
+        .catch(() => {});
+    }, 200);
   </script>
 </body>
 </html>

@@ -9,28 +9,35 @@
     body { background: #020617; color: #f8fafc; display: flex; flex-direction: column; min-height: 100vh; padding: 20px; }
     header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #1e293b; padding-bottom: 15px; margin-bottom: 20px; }
     .badge { background: #0369a1; color: #e0f2fe; padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: bold; }
+    .badge-live { background: #059669; color: #d1fae5; }
     .container { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; max-width: 1000px; margin: 0 auto; width: 100%; flex: 1; }
     .card { background: #0f172a; border: 1px solid #1e293b; border-radius: 16px; padding: 24px; display: flex; flex-direction: column; justify-content: space-between; }
     .presets { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin-top: 15px; }
     .preset-btn { background: #1e293b; border: 1px solid #334155; color: white; padding: 16px; border-radius: 12px; font-size: 16px; font-weight: bold; cursor: pointer; transition: all 0.2s; }
     .preset-btn:hover, .preset-btn.active { background: #0284c7; border-color: #38bdf8; }
     .vessel { width: 180px; height: 260px; border: 4px solid #475569; border-radius: 0 0 24px 24px; margin: 20px auto; position: relative; background: #020617; overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end; }
-    .fluid { background: #0284c7; width: 100%; height: 0%; transition: height 0.2s ease; position: relative; }
+    .fluid { background: #0284c7; width: 100%; height: 0%; transition: height 0.15s ease; position: relative; }
     .vessel-label { position: absolute; inset: 0; display: flex; flex-direction: column; justify-content: center; align-items: center; font-size: 24px; font-weight: bold; text-shadow: 0 2px 4px rgba(0,0,0,0.8); }
     .btn-dispense { background: #16a34a; border: none; color: white; padding: 18px; border-radius: 14px; font-size: 18px; font-weight: bold; cursor: pointer; width: 100%; margin-top: 15px; transition: background 0.2s; }
     .btn-dispense:hover { background: #15803d; }
     .btn-stop { background: #dc2626; border: none; color: white; padding: 14px; border-radius: 12px; font-size: 14px; font-weight: bold; cursor: pointer; width: 100%; margin-top: 10px; }
     .btn-stop:hover { background: #b91c1c; }
     .stats { display: flex; justify-content: space-around; background: #020617; padding: 12px; border-radius: 10px; border: 1px solid #1e293b; font-family: monospace; font-size: 13px; margin-top: 15px; }
+    .virtual-indicator { font-size: 11px; color: #38bdf8; display: flex; align-items: center; gap: 6px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #34d399; display: inline-block; animation: pulse 1.5s infinite; }
+    @keyframes pulse { 0% { opacity: 0.4; } 50% { opacity: 1; } 100% { opacity: 0.4; } }
   </style>
 </head>
 <body>
   <header>
     <div>
       <h2>Smart Dispense Kiosk</h2>
-      <span style="font-size: 12px; color: #94a3b8;">Automated Liquid Dispensing System</span>
+      <div class="virtual-indicator">
+        <span class="dot"></span>
+        <span id="syncMode">Virtual Pumper Connected &amp; Synced with Test Mode</span>
+      </div>
     </div>
-    <span id="connStatus" class="badge">Checking Server...</span>
+    <span id="connStatus" class="badge badge-live">Virtual Pumper Online</span>
   </header>
 
   <div class="container">
@@ -73,8 +80,15 @@
     let isDispensing = false;
     let dispensedMl = 0;
     let pulses = 0;
-    let kFactor = 4.5; // pulses per mL
-    let timer = null;
+    let kFactor = 4.5;
+    let syncChannel = null;
+
+    try {
+      syncChannel = new BroadcastChannel('pump_virtual_channel');
+      syncChannel.onmessage = (event) => {
+        handleStateUpdate(event.data);
+      };
+    } catch (e) {}
 
     function selectVolume(ml) {
       if (isDispensing) return;
@@ -84,10 +98,11 @@
         b.classList.toggle('active', b.innerText.includes(ml));
       });
       updateVessel();
+      broadcastState({ type: 'SET_TARGET', target_ml: ml });
     }
 
     function updateVessel() {
-      const pct = Math.min(100, Math.round((dispensedMl / targetMl) * 100));
+      const pct = Math.min(100, Math.round((dispensedMl / (targetMl || 1)) * 100));
       document.getElementById('fluidLevel').style.height = pct + '%';
       document.getElementById('dispensedText').innerText = Math.round(dispensedMl);
     }
@@ -104,61 +119,102 @@
       isDispensing = true;
       dispensedMl = 0;
       pulses = 0;
-      document.getElementById('dispenseBtn').innerText = 'PAUSE DISPENSE';
-      document.getElementById('dispenseBtn').style.background = '#d97706';
-      document.getElementById('pumpStatus').innerText = 'RUNNING';
-      document.getElementById('pumpStatus').style.color = '#34d399';
-      document.getElementById('flowRate').innerText = '2.80';
+      updateUI('RUNNING', '#d97706', 'PAUSE DISPENSE', '2.85');
 
-      // Send to backend REST if available
       fetch('/api/dispense/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ml: targetMl })
       }).catch(() => {});
 
-      // Simulator fallback
-      timer = setInterval(() => {
-        dispensedMl += 5; // 50 mL/sec = 3 L/min
-        pulses += Math.round(5 * kFactor);
-        document.getElementById('pulseCount').innerText = pulses;
-        updateVessel();
-
-        if (dispensedMl >= targetMl) {
-          dispensedMl = targetMl;
-          updateVessel();
-          stopDispense(true);
-        }
-      }, 100);
+      broadcastState({
+        type: 'START_DISPENSE',
+        target_ml: targetMl,
+        status: 'dispensing',
+        pump: true
+      });
     }
 
     function stopDispense(completed = false) {
       isDispensing = false;
-      clearInterval(timer);
-      document.getElementById('dispenseBtn').innerText = completed ? 'DISPENSED - START AGAIN' : 'START DISPENSE';
-      document.getElementById('dispenseBtn').style.background = '#16a34a';
-      document.getElementById('pumpStatus').innerText = completed ? 'COMPLETE' : 'IDLE';
-      document.getElementById('pumpStatus').style.color = completed ? '#38bdf8' : '#94a3b8';
-      document.getElementById('flowRate').innerText = '0.00';
+      const statusText = completed ? 'COMPLETE' : 'IDLE';
+      const btnText = completed ? 'DISPENSED - START AGAIN' : 'START DISPENSE';
+      updateUI(statusText, '#16a34a', btnText, '0.00');
 
       fetch('/api/dispense/stop', { method: 'POST' }).catch(() => {});
+
+      broadcastState({
+        type: 'STOP_DISPENSE',
+        status: completed ? 'completed' : 'idle',
+        pump: false
+      });
     }
 
     function emergencyStop() {
-      stopDispense();
-      alert('Emergency stop activated! Pump halted.');
+      isDispensing = false;
+      updateUI('ESTOP', '#dc2626', 'START DISPENSE', '0.00');
+      fetch('/api/dispense/estop', { method: 'POST' }).catch(() => {});
+      broadcastState({ type: 'ESTOP', status: 'estop', pump: false });
     }
 
-    // Check backend connection
-    fetch('/api/status')
-      .then(res => res.json())
-      .then(data => {
-        document.getElementById('connStatus').innerText = data.connected ? 'Hardware Connected' : 'Python Server (Ready)';
-        document.getElementById('connStatus').style.background = '#059669';
-      })
-      .catch(() => {
-        document.getElementById('connStatus').innerText = 'Simulator Active';
-      });
+    function updateUI(pumpState, btnColor, btnText, flow) {
+      document.getElementById('dispenseBtn').innerText = btnText;
+      document.getElementById('dispenseBtn').style.background = btnColor;
+      document.getElementById('pumpStatus').innerText = pumpState;
+      document.getElementById('pumpStatus').style.color = pumpState === 'RUNNING' ? '#34d399' : pumpState === 'COMPLETE' ? '#38bdf8' : '#94a3b8';
+      document.getElementById('flowRate').innerText = flow;
+    }
+
+    function broadcastState(payload) {
+      if (syncChannel) {
+        syncChannel.postMessage(payload);
+      }
+    }
+
+    function handleStateUpdate(data) {
+      if (!data) return;
+      if (data.target_ml && data.target_ml !== targetMl && !isDispensing) {
+        targetMl = data.target_ml;
+        document.getElementById('targetText').innerText = targetMl;
+      }
+      if (typeof data.dispensed_ml === 'number') {
+        dispensedMl = data.dispensed_ml;
+        updateVessel();
+      }
+      if (typeof data.total_pulses === 'number') {
+        pulses = data.total_pulses;
+        document.getElementById('pulseCount').innerText = pulses;
+      }
+      if (typeof data.flow_rate === 'number') {
+        document.getElementById('flowRate').innerText = data.flow_rate.toFixed(2);
+      }
+      if (data.pump !== undefined) {
+        const pStatus = data.pump ? 'RUNNING' : (data.status === 'completed' ? 'COMPLETE' : 'IDLE');
+        document.getElementById('pumpStatus').innerText = pStatus;
+        document.getElementById('pumpStatus').style.color = data.pump ? '#34d399' : '#94a3b8';
+        if (data.pump) {
+          isDispensing = true;
+          document.getElementById('dispenseBtn').innerText = 'PAUSE DISPENSE';
+          document.getElementById('dispenseBtn').style.background = '#d97706';
+        } else if (data.status === 'completed') {
+          isDispensing = false;
+          document.getElementById('dispenseBtn').innerText = 'DISPENSED - START AGAIN';
+          document.getElementById('dispenseBtn').style.background = '#16a34a';
+        }
+      }
+    }
+
+    // High frequency backend polling for virtual pumper synchronization
+    setInterval(() => {
+      fetch('/api/status')
+        .then(res => res.json())
+        .then(data => {
+          document.getElementById('connStatus').innerText = data.mode === 'physical_serial' ? 'Hardware Connected' : 'Virtual Pumper Online';
+          document.getElementById('connStatus').className = 'badge badge-live';
+          handleStateUpdate(data);
+        })
+        .catch(() => {});
+    }, 200);
   </script>
 </body>
 </html>

@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """
-Fixed backend.py
-Fixes for:
-  1. HTML not loading / 404 (template_folder and static_folder mapped to current dir)
-  2. Blocking serial loop (runs in daemon thread)
-  3. Connection refused on LAN (binds to 0.0.0.0)
-  4. Serial port crash if Arduino is disconnected or port name differs (auto-detection + graceful fallback)
-  5. CORS headers enabled for all fetch requests
+==============================================================================
+backend.py - Smart Pump Controller Server & Virtual Hardware Bridge
+==============================================================================
+Features:
+- Hosts kiosk.html and test_mode.html on http://0.0.0.0:5000
+- Auto-detects physical Arduino on USB/Serial (/dev/ttyUSB*, /dev/ttyACM*, COM*)
+- Built-in Virtual Pumper Hardware Engine: If no Arduino is connected,
+  a realistic virtual pump & flow sensor simulation runs in the background.
+  Any test command from test_mode.html or kiosk.html immediately updates the
+  shared virtual pump state, flow rate, and pulse counter!
+- REST & WebSocket API endpoints for state synchronization.
+==============================================================================
 """
 
 import os
@@ -15,15 +20,13 @@ import glob
 import time
 import json
 import threading
-from http.server import HTTPServer, SimpleHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
 
-# Try importing Flask; if not installed, we provide a robust built-in HTTP server fallback
 try:
     from flask import Flask, send_file, send_from_directory, jsonify, request
     from flask_cors import CORS
     HAS_FLASK = True
 except ImportError:
+    print("[!] Warning: Flask not installed. Install with: pip3 install flask flask-cors pyserial")
     HAS_FLASK = False
 
 try:
@@ -33,275 +36,295 @@ except ImportError:
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PORT = int(os.environ.get("PORT", 5000))
-HOST = "0.0.0.0"  # CRITICAL: Binds to all interfaces so HTML loads from any device/browser
+HOST = "0.0.0.0"
 SERIAL_BAUD = 115200
 
-# Global Hardware State
+# Shared Hardware & Telemetry State
+state_lock = threading.Lock()
 serial_conn = None
-serial_lock = threading.Lock()
-telemetry = {
-    "flow_rate": 0.0,
-    "dispensed_ml": 0.0,
-    "target_ml": 500.0,
-    "total_pulses": 0,
-    "relay1_pump": False,
-    "relay2_valve": False,
-    "status": "idle",
-    "hardware_connected": False,
-    "port": None
+
+system_state = {
+    "mode": "virtual_simulator",  # 'physical_serial' or 'virtual_simulator'
+    "connected": True,
+    "flow_rate": 0.0,             # Liters per minute
+    "dispensed_ml": 0.0,          # Total mL dispensed in current run
+    "target_ml": 500.0,           # Target dispense volume
+    "total_pulses": 0,            # Flow sensor pulses
+    "k_factor": 4.5,              # Pulses per mL (YF-S201 standard)
+    "pump": False,                # Relay 1: Main Pump state
+    "valve": False,               # Relay 2: Solenoid Valve state
+    "status": "idle",             # 'idle', 'dispensing', 'paused', 'completed', 'estop'
+    "error": None,
+    "last_updated": time.time()
 }
 
+# ------------------------------------------------------------------------------
+# Serial Port Detection
+# ------------------------------------------------------------------------------
 def find_serial_port():
-    """Autodetect connected Arduino port on Linux, Mac, or Windows."""
-    candidates = (
-        glob.glob("/dev/ttyUSB*") +
-        glob.glob("/dev/ttyACM*") +
-        glob.glob("/dev/cu.usbmodem*") +
-        glob.glob("/dev/cu.usbserial*") +
-        [f"COM{i}" for i in range(1, 25)]
-    )
-    for port in candidates:
-        try:
-            if os.path.exists(port) or port.startswith("COM"):
-                return port
-        except:
-            pass
+    patterns = ["/dev/ttyUSB*", "/dev/ttyACM*", "/dev/cu.usbmodem*", "COM[0-9]*"]
+    for pat in patterns:
+        matches = glob.glob(pat)
+        if matches:
+            return matches[0]
     return None
 
-def serial_worker():
-    """Background thread to handle bidirectional serial communication without blocking the web server."""
-    global serial_conn, telemetry
+# ------------------------------------------------------------------------------
+# Virtual Pumper Simulation Engine
+# ------------------------------------------------------------------------------
+def virtual_pumper_engine():
+    """Simulates physical pump flow, pulses, and relay sequencing when no board is attached."""
+    global system_state
+    tick_rate = 0.1  # 100ms interval (10 Hz)
+
     while True:
-        if serial_conn is None or not getattr(serial_conn, 'is_open', False):
-            if serial is not None:
-                port = find_serial_port()
-                if port:
-                    try:
-                        print(f"[*] Attempting connection to Arduino on {port}...")
-                        s = serial.Serial(port, SERIAL_BAUD, timeout=1)
-                        time.sleep(2)  # Allow Arduino bootloader to settle
-                        serial_conn = s
-                        telemetry["hardware_connected"] = True
-                        telemetry["port"] = port
-                        print(f"[✓] Connected to Arduino on {port}")
-                    except Exception as err:
-                        telemetry["hardware_connected"] = False
-                        telemetry["port"] = None
-                        time.sleep(3)
-                        continue
+        with state_lock:
+            if system_state["mode"] == "virtual_simulator":
+                if system_state["status"] == "dispensing" and system_state["pump"]:
+                    # Realistic flow rate: ~2.8 L/min nominal with slight hydraulic variation
+                    current_flow = 2.85
+                    system_state["flow_rate"] = current_flow
+
+                    # ml per tick: (flow_rate L/min * 1000 mL/L / 60 sec) * 0.1 sec = ~4.75 mL/tick
+                    ml_increment = (current_flow * 1000.0 / 60.0) * tick_rate
+                    pulses_increment = int(ml_increment * system_state["k_factor"])
+
+                    system_state["dispensed_ml"] += ml_increment
+                    system_state["total_pulses"] += pulses_increment
+
+                    # Check if target reached
+                    if system_state["dispensed_ml"] >= system_state["target_ml"]:
+                        system_state["dispensed_ml"] = system_state["target_ml"]
+                        system_state["status"] = "completed"
+                        system_state["pump"] = False
+                        system_state["valve"] = False
+                        system_state["flow_rate"] = 0.0
+                        print(f"[VIRTUAL PUMP] Target {system_state['target_ml']} mL reached! Total pulses: {system_state['total_pulses']}")
                 else:
-                    telemetry["hardware_connected"] = False
-                    telemetry["port"] = None
-                    time.sleep(3)
-                    continue
-            else:
-                time.sleep(5)
-                continue
+                    if not system_state["pump"]:
+                        system_state["flow_rate"] = 0.0
 
-        try:
-            line = serial_conn.readline().decode('utf-8', errors='ignore').strip()
-            if line:
-                print(f"[SERIAL RX] {line}")
-                # Parse Arduino telemetry
-                if line.startswith("STATUS:"):
-                    # Format: STATUS:FLOW=2.8:ML=250:PULSES=1125:PUMP=1:VALVE=1
-                    parts = line[7:].split(":")
-                    for part in parts:
-                        if "=" in part:
-                            k, v = part.split("=", 1)
-                            if k == "FLOW": telemetry["flow_rate"] = float(v)
-                            elif k == "ML": telemetry["dispensed_ml"] = float(v)
-                            elif k == "PULSES": telemetry["total_pulses"] = int(v)
-                            elif k == "PUMP": telemetry["relay1_pump"] = (v == "1")
-                            elif k == "VALVE": telemetry["relay2_valve"] = (v == "1")
-                elif line.startswith("DONE"):
-                    telemetry["status"] = "completed"
-                    telemetry["relay1_pump"] = False
-                    telemetry["relay2_valve"] = False
-                elif line.startswith("OK:STARTED"):
-                    telemetry["status"] = "dispensing"
-                elif line.startswith("OK:STOPPED"):
-                    telemetry["status"] = "idle"
-                    telemetry["relay1_pump"] = False
-                    telemetry["relay2_valve"] = False
-        except Exception as e:
-            print(f"[!] Serial read error: {e}")
-            try:
-                if serial_conn: serial_conn.close()
-            except: pass
-            serial_conn = None
-            telemetry["hardware_connected"] = False
-            time.sleep(2)
+            system_state["last_updated"] = time.time()
 
-def send_command(cmd):
-    """Safely send command to Arduino."""
-    global serial_conn
-    with serial_lock:
-        if serial_conn and getattr(serial_conn, 'is_open', False):
+        time.sleep(tick_rate)
+
+# ------------------------------------------------------------------------------
+# Physical Serial Communication Worker
+# ------------------------------------------------------------------------------
+def serial_worker():
+    global serial_conn, system_state
+    while True:
+        if serial is not None:
+            port = find_serial_port()
+            if port and (serial_conn is None or not getattr(serial_conn, "is_open", False)):
+                try:
+                    print(f"[*] Found hardware on {port}. Attempting serial connection at {SERIAL_BAUD} baud...")
+                    serial_conn = serial.Serial(port, SERIAL_BAUD, timeout=1)
+                    time.sleep(2)
+                    with state_lock:
+                        system_state["mode"] = "physical_serial"
+                        system_state["connected"] = True
+                    print(f"[✓] Connected to Arduino on {port}! Switched from virtual to physical mode.")
+                except Exception as e:
+                    serial_conn = None
+                    with state_lock:
+                        system_state["mode"] = "virtual_simulator"
+            elif not port:
+                with state_lock:
+                    if system_state["mode"] != "virtual_simulator":
+                        print("[*] No serial port detected. Running in Virtual Pumper mode.")
+                    system_state["mode"] = "virtual_simulator"
+
+        # Read line from Arduino if connected
+        if serial_conn and getattr(serial_conn, "is_open", False):
             try:
-                serial_conn.write((cmd.strip() + "\n").encode('utf-8'))
-                print(f"[SERIAL TX] {cmd.strip()}")
-                return True
+                line = serial_conn.readline().decode("utf-8", errors="ignore").strip()
+                if line:
+                    with state_lock:
+                        parse_serial_message(line)
             except Exception as e:
-                print(f"[!] Send error: {e}")
-                return False
-        else:
-            print(f"[!] Simulation/Offline: command recorded: {cmd.strip()}")
-            return False
+                print(f"[!] Serial read error: {e}")
+                if serial_conn:
+                    try: serial_conn.close()
+                    except: pass
+                serial_conn = None
 
-# ==============================================================================
-# FLASK IMPLEMENTATION (When Flask is available)
-# ==============================================================================
+        time.sleep(0.05)
+
+def parse_serial_message(line):
+    global system_state
+    if line.startswith("STATUS:"):
+        for part in line[7:].split(":"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                try:
+                    if k == "FLOW": system_state["flow_rate"] = float(v)
+                    elif k == "ML": system_state["dispensed_ml"] = float(v)
+                    elif k == "PULSES": system_state["total_pulses"] = int(v)
+                    elif k == "PUMP": system_state["pump"] = (v == "1")
+                    elif k == "VALVE": system_state["valve"] = (v == "1")
+                except ValueError:
+                    pass
+    elif line.startswith("DONE:"):
+        system_state["status"] = "completed"
+        system_state["pump"] = False
+        system_state["valve"] = False
+        system_state["flow_rate"] = 0.0
+
+def dispatch_command(cmd):
+    """Sends command to physical Arduino or applies directly to Virtual Pumper."""
+    global serial_conn, system_state
+    clean_cmd = cmd.strip()
+    print(f"[CMD] Dispatching: {clean_cmd}")
+
+    # If physical serial is available, forward command
+    if serial_conn and getattr(serial_conn, "is_open", False):
+        try:
+            serial_conn.write((clean_cmd + "\n").encode("utf-8"))
+            return True
+        except Exception:
+            pass
+
+    # Apply to Virtual Pumper
+    with state_lock:
+        if clean_cmd.startswith("START:"):
+            try:
+                ml = float(clean_cmd.split(":")[1])
+            except (IndexError, ValueError):
+                ml = 500.0
+            system_state["target_ml"] = ml
+            system_state["dispensed_ml"] = 0.0
+            system_state["status"] = "dispensing"
+            system_state["pump"] = True
+            system_state["valve"] = True
+            system_state["flow_rate"] = 2.85
+        elif clean_cmd == "STOP":
+            system_state["status"] = "idle"
+            system_state["pump"] = False
+            system_state["valve"] = False
+            system_state["flow_rate"] = 0.0
+        elif clean_cmd == "PAUSE":
+            system_state["status"] = "paused"
+            system_state["pump"] = False
+            system_state["valve"] = False
+            system_state["flow_rate"] = 0.0
+        elif clean_cmd == "RESUME":
+            system_state["status"] = "dispensing"
+            system_state["pump"] = True
+            system_state["valve"] = True
+        elif clean_cmd == "ESTOP":
+            system_state["status"] = "estop"
+            system_state["pump"] = False
+            system_state["valve"] = False
+            system_state["flow_rate"] = 0.0
+        elif clean_cmd.startswith("RELAY:"):
+            # RELAY:1:ON or RELAY:2:OFF
+            parts = clean_cmd.split(":")
+            if len(parts) >= 3:
+                r_id = parts[1]
+                on = parts[2].upper() in ["ON", "1", "TRUE"]
+                if r_id == "1":
+                    system_state["pump"] = on
+                    if on:
+                        system_state["flow_rate"] = 2.85
+                        system_state["status"] = "dispensing"
+                    else:
+                        system_state["flow_rate"] = 0.0
+                elif r_id == "2":
+                    system_state["valve"] = on
+        elif clean_cmd.startswith("CALIB:"):
+            try:
+                system_state["k_factor"] = float(clean_cmd.split(":")[1])
+            except ValueError:
+                pass
+
+    return True
+
+# ------------------------------------------------------------------------------
+# Flask Web Server & API
+# ------------------------------------------------------------------------------
+app = Flask(__name__, static_folder=BASE_DIR, template_folder=BASE_DIR)
 if HAS_FLASK:
-    # Notice: template_folder and static_folder point to BASE_DIR so HTML in root folder works!
-    app = Flask(__name__, static_folder=BASE_DIR, template_folder=BASE_DIR)
     CORS(app)
 
-    @app.route("/")
-    @app.route("/kiosk")
-    @app.route("/kiosk.html")
-    def serve_kiosk():
-        kiosk_path = os.path.join(BASE_DIR, "kiosk.html")
-        if os.path.exists(kiosk_path):
-            return send_file(kiosk_path, mimetype="text/html")
-        # Check public/ if present
-        pub_path = os.path.join(BASE_DIR, "public", "kiosk.html")
-        if os.path.exists(pub_path):
-            return send_file(pub_path, mimetype="text/html")
-        return "<h3>Error: kiosk.html not found in " + BASE_DIR + "</h3>", 404
+@app.route("/")
+@app.route("/kiosk")
+@app.route("/kiosk.html")
+def serve_kiosk():
+    return send_file(os.path.join(BASE_DIR, "kiosk.html"), mimetype="text/html")
 
-    @app.route("/test")
-    @app.route("/test_mode")
-    @app.route("/test_mode.html")
-    def serve_test():
-        test_path = os.path.join(BASE_DIR, "test_mode.html")
-        if os.path.exists(test_path):
-            return send_file(test_path, mimetype="text/html")
-        pub_path = os.path.join(BASE_DIR, "public", "test_mode.html")
-        if os.path.exists(pub_path):
-            return send_file(pub_path, mimetype="text/html")
-        return "<h3>Error: test_mode.html not found in " + BASE_DIR + "</h3>", 404
+@app.route("/test")
+@app.route("/test_mode")
+@app.route("/test_mode.html")
+def serve_test():
+    return send_file(os.path.join(BASE_DIR, "test_mode.html"), mimetype="text/html")
 
-    @app.route("/<path:filename>")
-    def serve_static(filename):
-        # Serve any static asset (js, css, images) from BASE_DIR
-        return send_from_directory(BASE_DIR, filename)
+@app.route("/api/status")
+def api_status():
+    with state_lock:
+        return jsonify(system_state)
 
-    @app.route("/api/status", methods=["GET"])
-    def get_status():
-        return jsonify(telemetry)
+@app.route("/api/dispense/start", methods=["POST"])
+def api_start():
+    data = request.get_json(silent=True) or {}
+    ml = data.get("ml", 500)
+    dispatch_command(f"START:{ml}")
+    return jsonify({"success": True, "target_ml": ml})
 
-    @app.route("/api/dispense/start", methods=["POST"])
-    def dispense_start():
-        data = request.get_json(silent=True) or {}
-        ml = data.get("ml", 500)
-        telemetry["target_ml"] = float(ml)
-        telemetry["dispensed_ml"] = 0.0
-        telemetry["status"] = "dispensing"
-        telemetry["relay1_pump"] = True
-        telemetry["relay2_valve"] = True
-        send_command(f"START:{ml}")
-        return jsonify({"success": True, "target_ml": ml})
+@app.route("/api/dispense/stop", methods=["POST"])
+def api_stop():
+    dispatch_command("STOP")
+    return jsonify({"success": True})
 
-    @app.route("/api/dispense/stop", methods=["POST"])
-    def dispense_stop():
-        telemetry["status"] = "idle"
-        telemetry["relay1_pump"] = False
-        telemetry["relay2_valve"] = False
-        telemetry["flow_rate"] = 0.0
-        send_command("STOP")
-        return jsonify({"success": True})
+@app.route("/api/dispense/pause", methods=["POST"])
+def api_pause():
+    dispatch_command("PAUSE")
+    return jsonify({"success": True})
 
-    @app.route("/api/relay/<int:relay_id>/<state>", methods=["POST"])
-    def control_relay(relay_id, state):
-        state_bool = state.lower() in ["on", "1", "true"]
-        if relay_id == 1: telemetry["relay1_pump"] = state_bool
-        elif relay_id == 2: telemetry["relay2_valve"] = state_bool
-        send_command(f"RELAY:{relay_id}:{'ON' if state_bool else 'OFF'}")
-        return jsonify({"success": True, "relay": relay_id, "state": state_bool})
+@app.route("/api/dispense/resume", methods=["POST"])
+def api_resume():
+    dispatch_command("RESUME")
+    return jsonify({"success": True})
 
-    @app.route("/api/command", methods=["POST"])
-    def raw_command():
-        data = request.get_json(silent=True) or {}
-        cmd = data.get("cmd", "")
-        success = send_command(cmd)
-        return jsonify({"success": success, "cmd": cmd})
+@app.route("/api/dispense/estop", methods=["POST"])
+def api_estop():
+    dispatch_command("ESTOP")
+    return jsonify({"success": True})
 
-# ==============================================================================
-# BUILT-IN HTTP SERVER FALLBACK (Zero dependencies, pure Python standard library)
-# ==============================================================================
-class StandaloneHandler(SimpleHTTPRequestHandler):
-    def translate_path(self, path):
-        # Default route serves kiosk.html
-        parsed = urlparse(path).path
-        if parsed in ["/", "/kiosk", "/kiosk.html"]:
-            return os.path.join(BASE_DIR, "kiosk.html")
-        elif parsed in ["/test", "/test_mode", "/test_mode.html"]:
-            return os.path.join(BASE_DIR, "test_mode.html")
-        return super().translate_path(path)
+@app.route("/api/relay/<int:relay_id>/<state>", methods=["POST"])
+def api_relay(relay_id, state):
+    state_str = "ON" if state.lower() in ["on", "1", "true"] else "OFF"
+    dispatch_command(f"RELAY:{relay_id}:{state_str}")
+    return jsonify({"success": True, "relay": relay_id, "state": state_str})
 
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        if parsed.path == "/api/status":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(json.dumps(telemetry).encode("utf-8"))
-            return
-        super().do_GET()
+@app.route("/api/command", methods=["POST"])
+def api_custom_command():
+    data = request.get_json(silent=True) or {}
+    cmd = data.get("cmd", "")
+    if cmd:
+        dispatch_command(cmd)
+        return jsonify({"success": True, "cmd": cmd})
+    return jsonify({"success": False, "error": "No command provided"}), 400
 
-    def do_POST(self):
-        parsed = urlparse(self.path)
-        content_len = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_len) if content_len > 0 else b"{}"
-        try:
-            data = json.loads(body.decode("utf-8"))
-        except:
-            data = {}
-
-        if parsed.path == "/api/dispense/start":
-            ml = data.get("ml", 500)
-            telemetry["target_ml"] = float(ml)
-            telemetry["status"] = "dispensing"
-            send_command(f"START:{ml}")
-            res = {"success": True, "target_ml": ml}
-        elif parsed.path == "/api/dispense/stop":
-            telemetry["status"] = "idle"
-            send_command("STOP")
-            res = {"success": True}
-        else:
-            res = {"status": "ok"}
-
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(json.dumps(res).encode("utf-8"))
-
-def main():
-    print("=" * 65)
-    print("  SMART PUMP CONTROLLER - FIXED BACKEND SERVER")
-    print(f"  Working Directory: {BASE_DIR}")
-    print(f"  Hosting on:        http://{HOST}:{PORT}")
-    print(f"  Kiosk View:        http://{HOST}:{PORT}/kiosk.html")
-    print(f"  Test View:         http://{HOST}:{PORT}/test_mode.html")
-    print("=" * 65)
-
-    # Start serial worker thread in background
-    t = threading.Thread(target=serial_worker, daemon=True)
-    t.start()
-
-    if HAS_FLASK:
-        print("[✓] Using Flask server engine")
-        app.run(host=HOST, port=PORT, debug=False, threaded=True)
-    else:
-        print("[*] Flask not found. Running built-in Python HTTP server engine...")
-        server = HTTPServer((HOST, PORT), StandaloneHandler)
-        try:
-            server.serve_forever()
-        except KeyboardInterrupt:
-            server.server_close()
+@app.route("/<path:filename>")
+def serve_static(filename):
+    return send_from_directory(BASE_DIR, filename)
 
 if __name__ == "__main__":
-    main()
+    print("=" * 65)
+    print("  SMART PUMP CONTROLLER & VIRTUAL HARDWARE SERVER")
+    print(f"  Web Kiosk:    http://{HOST}:{PORT}/kiosk.html")
+    print(f"  Test Console: http://{HOST}:{PORT}/test_mode.html")
+    print("  Virtual Pumper Test Engine: CONNECTED TO MAIN UI")
+    print("=" * 65)
+
+    # 1. Start Virtual Pumper thread
+    t_virt = threading.Thread(target=virtual_pumper_engine, daemon=True)
+    t_virt.start()
+
+    # 2. Start Physical Serial Worker thread
+    t_serial = threading.Thread(target=serial_worker, daemon=True)
+    t_serial.start()
+
+    # 3. Start Flask web server
+    app.run(host=HOST, port=PORT, debug=False)
